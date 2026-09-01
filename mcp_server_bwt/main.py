@@ -5,6 +5,8 @@ An MCP server that provides integration with Bing Webmaster Tools,
 enabling site management and analytics through AI assistants.
 """
 
+import contextvars
+import json
 import logging
 import os
 from typing import Annotated, Any, Dict, List, Optional
@@ -12,6 +14,9 @@ from urllib.parse import urlparse
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse, Response
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -21,7 +26,14 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP(
     name="mcp-server-bing-webmaster",
     instructions="Direct access to Bing Webmaster Tools API with OData compatibility",
+    host="0.0.0.0",
+    port=int(os.getenv("PORT", "8080")),
 )
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request: Request) -> Response:
+    return PlainTextResponse("ok", status_code=200)
 
 # Read-only gate: mutating tools are not registered when BWT_READ_ONLY is true (default).
 _READ_ONLY_FALSE_TOKENS = {"false", "0", "no"}
@@ -77,6 +89,69 @@ def _parse_allowed_sites(raw: str) -> frozenset[str]:
 ALLOWED_SITES = _parse_allowed_sites(os.getenv("BWT_ALLOWED_SITES", ""))
 
 
+# HTTP transport auth: single static bearer token (backward-compatible,
+# routes to the global API_KEY/ALLOWED_SITES) and/or a per-tenant token map
+# (routes each token to its own api_key/allowed_sites).
+MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "").strip() or None
+
+
+def _parse_tenants(raw: str) -> Dict[str, Dict[str, Any]]:
+    """Parse BWT_TENANTS into {bearer_token: {"api_key": str, "allowed_sites": frozenset[str]}}.
+
+    BWT_TENANTS is a JSON object: {"<token>": {"api_key": "...", "allowed_sites": ["https://..."]}}.
+    An empty/missing allowed_sites list is a config error (fail import), not
+    "allow all" — that would silently grant a misconfigured tenant broader
+    access than intended.
+    """
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"BWT_TENANTS is not valid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError("BWT_TENANTS must be a JSON object mapping bearer token to tenant config")
+
+    tenants: Dict[str, Dict[str, Any]] = {}
+    for token, entry in data.items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"BWT_TENANTS entry for token {token!r} must be a JSON object")
+
+        api_key = entry.get("api_key")
+        if not isinstance(api_key, str) or not api_key:
+            raise ValueError(
+                f"BWT_TENANTS entry for token {token!r} is missing a non-empty 'api_key'"
+            )
+
+        sites = entry.get("allowed_sites")
+        if not isinstance(sites, list) or not sites or not all(isinstance(s, str) for s in sites):
+            raise ValueError(
+                f"BWT_TENANTS entry for token {token!r} must have a non-empty 'allowed_sites' "
+                "list of site URL strings"
+            )
+
+        allowed = _parse_allowed_sites(",".join(sites))
+        if not allowed:
+            raise ValueError(
+                f"BWT_TENANTS entry for token {token!r} has no valid entries in 'allowed_sites'"
+            )
+        tenants[token] = {"api_key": api_key, "allowed_sites": allowed}
+    return tenants
+
+
+TENANTS = _parse_tenants(os.getenv("BWT_TENANTS", ""))
+
+# Carries the per-request (tenant-scoped) API key and site allowlist from the
+# HTTP auth middleware into BingWebmasterAPI._make_request. None (the
+# default, e.g. on stdio) means "use the global API_KEY/ALLOWED_SITES".
+_request_api_key: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "_request_api_key", default=None
+)
+_request_allowed_sites: contextvars.ContextVar[Optional[frozenset]] = contextvars.ContextVar(
+    "_request_allowed_sites", default=None
+)
+
+
 class BingWebmasterAPI:
     """Client for Bing Webmaster Tools API with OData response handling."""
 
@@ -102,14 +177,18 @@ class BingWebmasterAPI:
         params: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Make a request to the Bing API and handle OData responses."""
-        if ALLOWED_SITES:
+        effective_allowed_sites = _request_allowed_sites.get()
+        if effective_allowed_sites is None:
+            effective_allowed_sites = ALLOWED_SITES
+
+        if effective_allowed_sites:
             for source in (params, json_data):
                 if not source:
                     continue
                 for key in _SITE_PARAM_KEYS:
                     if key in source:
                         site_value = source[key]
-                        if _normalize_origin(site_value) not in ALLOWED_SITES:
+                        if _normalize_origin(site_value) not in effective_allowed_sites:
                             raise ValueError(
                                 f"Site {site_value!r} is not in the BWT_ALLOWED_SITES allowlist"
                             )
@@ -122,7 +201,7 @@ class BingWebmasterAPI:
         # Set apikey AFTER merging caller params to prevent override
         url = f"{self.base_url}/{endpoint}"
         all_params: Dict[str, Any] = dict(params) if params else {}
-        all_params["apikey"] = self.api_key
+        all_params["apikey"] = _request_api_key.get() or self.api_key
 
         try:
             if method == "GET":
@@ -1492,12 +1571,81 @@ async def remove_country_region_settings(
     return {"message": f"Country settings for {country_code} removed successfully"}
 
 
+class BearerTenantMiddleware(BaseHTTPMiddleware):
+    """Bearer-token auth for the HTTP transport, with per-tenant API key/allowlist routing.
+
+    - /health is exempt (no auth required).
+    - A token matching a BWT_TENANTS entry gets that tenant's api_key/allowed_sites
+      for the duration of the request (via contextvars).
+    - Otherwise, a token matching MCP_AUTH_TOKEN falls through to the global
+      API_KEY/ALLOWED_SITES (unscoped admin-style token).
+    - Anything else is rejected with 401.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path == "/health":
+            return await call_next(request)
+
+        auth_header = request.headers.get("authorization", "")
+        token = auth_header[7:] if auth_header.lower().startswith("bearer ") else None
+
+        tenant = TENANTS.get(token) if token else None
+        if tenant:
+            key_tok = _request_api_key.set(tenant["api_key"])
+            sites_tok = _request_allowed_sites.set(tenant["allowed_sites"])
+            try:
+                return await call_next(request)
+            finally:
+                _request_api_key.reset(key_tok)
+                _request_allowed_sites.reset(sites_tok)
+
+        if token and MCP_AUTH_TOKEN and token == MCP_AUTH_TOKEN:
+            return await call_next(request)
+
+        return PlainTextResponse("Unauthorized", status_code=401)
+
+
+def _require_http_auth_configured() -> None:
+    """HTTP transport must never come up unauthenticated."""
+    if not MCP_AUTH_TOKEN and not TENANTS:
+        raise ValueError(
+            "HTTP transport requires MCP_AUTH_TOKEN and/or BWT_TENANTS to be configured"
+        )
+
+
+def run_http() -> None:
+    """Run the MCP server over Streamable HTTP with bearer auth."""
+    _require_http_auth_configured()
+
+    import uvicorn
+
+    http_app = mcp.streamable_http_app()
+    http_app.add_middleware(BearerTenantMiddleware)
+    config = uvicorn.Config(
+        http_app,
+        host=mcp.settings.host,
+        port=mcp.settings.port,
+        log_level=mcp.settings.log_level.lower(),
+    )
+    uvicorn.Server(config).run()
+
+
 def app() -> None:
     """MCP server entrypoint."""
-    if not API_KEY:
+    transport = os.getenv("MCP_TRANSPORT", "stdio").strip().lower()
+    # A pure-tenants HTTP deployment (BWT_TENANTS set, no MCP_AUTH_TOKEN) never
+    # falls through to the global API_KEY, so it doesn't need one configured.
+    pure_tenant_http = transport == "http" and TENANTS and not MCP_AUTH_TOKEN
+    if not API_KEY and not pure_tenant_http:
         raise ValueError("BING_WEBMASTER_API_KEY environment variable is required")
-    logger.info("Starting Bing Webmaster MCP server")
-    mcp.run(transport="stdio")
+    if transport == "stdio":
+        logger.info("Starting Bing Webmaster MCP server (stdio)")
+        mcp.run(transport="stdio")
+    elif transport == "http":
+        logger.info("Starting Bing Webmaster MCP server (http)")
+        run_http()
+    else:
+        raise ValueError(f"Invalid MCP_TRANSPORT {transport!r}; expected 'stdio' or 'http'")
 
 
 if __name__ == "__main__":
