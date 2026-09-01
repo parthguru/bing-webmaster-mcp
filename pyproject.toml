@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mcp-server-bing-webmaster"
+name = "synectus-bing-webmaster-mcp"
 authors = [
   { name = "Isiah Wheeler", email = "github@isiahwheeler.com" },
 ]

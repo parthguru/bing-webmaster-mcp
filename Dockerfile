@@ -1,14 +1,38 @@
-FROM debian:bookworm
+# Production image for the Streamable HTTP transport (see main.py:run_http).
+# This replaces the previous mcp-proxy/Glama.ai scaffolding, which cloned
+# from GitHub at build time instead of using the local source tree and ran
+# the server over stdio behind a third-party proxy.
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    GLAMA_VERSION="1.0.0"
+FROM python:3.13-slim AS builder
 
-RUN (apt-get update) && (apt-get install -y --no-install-recommends build-essential curl wget software-properties-common libssl-dev zlib1g-dev git) && (rm -rf /var/lib/apt/lists/*) && (curl -fsSL https://deb.nodesource.com/setup_24.x | bash -) && (apt-get install -y nodejs) && (apt-get clean) && (npm install -g mcp-proxy@^5.3) && (npm install -g pnpm@10.12.1) && (node --version) && (curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR="/usr/local/bin" sh) && (uv python install 3.13 --default --preview) && (ln -s $(uv python find) /usr/local/bin/python) && (python --version) && (apt-get clean) && (rm -rf /var/lib/apt/lists/*) && (rm -rf /tmp/*) && (rm -rf /var/tmp/*) && (uv python install 3.13 --default --preview && python --version)
+COPY --from=ghcr.io/astral-sh/uv:0.7.8 /uv /uvx /bin/
 
 WORKDIR /app
 
-RUN git clone https://github.com/isiahw1/mcp-server-bing-webmaster . && git checkout 869622b01d95a2b65f9e717298a779f10a2c4ed2
+COPY pyproject.toml README.md ./
+COPY mcp_server_bwt/ ./mcp_server_bwt/
 
-RUN (npm run build)
+RUN uv sync --no-dev
 
-CMD ["mcp-proxy"]
+FROM python:3.13-slim
+
+RUN groupadd --system appuser \
+    && useradd --system --gid appuser --home-dir /app --shell /usr/sbin/nologin appuser
+
+WORKDIR /app
+
+COPY --from=builder /app /app
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    MCP_TRANSPORT=http \
+    PORT=8080 \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 8080
+
+USER appuser
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD python -c "import os,urllib.request,sys; sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{os.environ[\"PORT\"]}/health', timeout=2).status == 200 else 1)"
+
+CMD ["mcp-server-bing-webmaster"]
