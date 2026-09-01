@@ -8,6 +8,7 @@ enabling site management and analytics through AI assistants.
 import logging
 import os
 from typing import Annotated, Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -37,6 +38,44 @@ def mutating_tool(**kw):
 API_BASE_URL = "https://ssl.bing.com/webmaster/api.svc/json"
 API_KEY = os.getenv("BING_WEBMASTER_API_KEY", "")
 
+# Site allowlist: keys that carry a site URL into a request, across every tool
+# (grep-verified: siteUrl for 59 of the 60 tools; submit_site_move uses
+# oldSiteUrl/newSiteUrl instead since it has no siteUrl of its own). get_sites
+# is the only tool with no site parameter, so it never hits this check.
+_SITE_PARAM_KEYS = ("siteUrl", "oldSiteUrl", "newSiteUrl")
+
+
+def _normalize_origin(url: str) -> str:
+    """Normalize a URL to a bare origin (scheme+host+port) for comparison.
+
+    BWT site URLs are treated as origins, not paths: every site_url docstring
+    in this file describes it as "the URL of the site", and BWT commonly
+    returns/expects a trailing slash (e.g. https://example.com/), so naive
+    string equality would falsely reject a matching site.
+    """
+    parsed = urlparse(url)
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
+def _parse_allowed_sites(raw: str) -> frozenset[str]:
+    """Parse BWT_ALLOWED_SITES into a normalized origin set. Empty = allow all."""
+    origins: set[str] = set()
+    for entry in (e.strip() for e in raw.split(",")):
+        if not entry:
+            continue
+        parsed = urlparse(entry)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError(
+                f"BWT_ALLOWED_SITES entry {entry!r} is missing a scheme or host; "
+                "expected e.g. https://example.com"
+            )
+        origins.add(_normalize_origin(entry))
+    return frozenset(origins)
+
+
+# Empty/unset = allow all sites (default, matches prior unrestricted behavior).
+ALLOWED_SITES = _parse_allowed_sites(os.getenv("BWT_ALLOWED_SITES", ""))
+
 
 class BingWebmasterAPI:
     """Client for Bing Webmaster Tools API with OData response handling."""
@@ -63,6 +102,18 @@ class BingWebmasterAPI:
         params: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Make a request to the Bing API and handle OData responses."""
+        if ALLOWED_SITES:
+            for source in (params, json_data):
+                if not source:
+                    continue
+                for key in _SITE_PARAM_KEYS:
+                    if key in source:
+                        site_value = source[key]
+                        if _normalize_origin(site_value) not in ALLOWED_SITES:
+                            raise ValueError(
+                                f"Site {site_value!r} is not in the BWT_ALLOWED_SITES allowlist"
+                            )
+
         client = await self._ensure_client()
 
         headers = {"Content-Type": "application/json; charset=utf-8"}
