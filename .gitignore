@@ -180,6 +180,16 @@ results/
 .env
 .env.*
 !.env.example
+.secrets/
+# Credential files, named explicitly rather than relying on the blanket *.json
+# rule above -- that rule carries !exceptions and a future one could silently
+# make a key committable.
+*-sa.json
+service-account*.json
+service_account*.json
+client_secret*.json
+*credentials*.json
+gsc-sa.json
 
 # Internal documentation (not for public)
 .internal-docs/
