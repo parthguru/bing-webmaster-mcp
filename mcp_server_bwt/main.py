@@ -22,6 +22,17 @@ mcp = FastMCP(
     instructions="Direct access to Bing Webmaster Tools API with OData compatibility",
 )
 
+# Read-only gate: mutating tools are not registered when BWT_READ_ONLY is true (default).
+_READ_ONLY_FALSE_TOKENS = {"false", "0", "no"}
+READ_ONLY = os.getenv("BWT_READ_ONLY", "true").strip().lower() not in _READ_ONLY_FALSE_TOKENS
+
+
+def mutating_tool(**kw):
+    def deco(fn):
+        return fn if READ_ONLY else mcp.tool(**kw)(fn)
+    return deco
+
+
 # API configuration
 API_BASE_URL = "https://ssl.bing.com/webmaster/api.svc/json"
 API_KEY = os.getenv("BING_WEBMASTER_API_KEY", "")
@@ -116,7 +127,7 @@ async def get_sites() -> List[Dict[str, Any]]:
     return api._ensure_type_field(sites, "Site")
 
 
-@mcp.tool(name="add_site", description="Add a new site to Bing Webmaster Tools")
+@mutating_tool(name="add_site", description="Add a new site to Bing Webmaster Tools")
 async def add_site(site_url: Annotated[str, "The URL of the site to add"]) -> Dict[str, str]:
     """
     Add a new site to Bing Webmaster Tools.
@@ -131,7 +142,7 @@ async def add_site(site_url: Annotated[str, "The URL of the site to add"]) -> Di
     return {"message": f"Site {site_url} added successfully"}
 
 
-@mcp.tool(name="verify_site", description="Attempt to verify ownership of a site")
+@mutating_tool(name="verify_site", description="Attempt to verify ownership of a site")
 async def verify_site(site_url: Annotated[str, "The URL of the site to verify"]) -> Dict[str, Any]:
     """
     Attempt to verify ownership of a site.
@@ -146,7 +157,7 @@ async def verify_site(site_url: Annotated[str, "The URL of the site to verify"])
     return {"verified": result, "site_url": site_url}
 
 
-@mcp.tool(name="remove_site", description="Remove a site from Bing Webmaster Tools")
+@mutating_tool(name="remove_site", description="Remove a site from Bing Webmaster Tools")
 async def remove_site(site_url: Annotated[str, "The URL of the site to remove"]) -> Dict[str, str]:
     """
     Remove a site from Bing Webmaster Tools.
@@ -247,7 +258,7 @@ async def get_crawl_issues(site_url: Annotated[str, "The URL of the site"]) -> L
 
 
 # URL Submission Tools
-@mcp.tool(name="submit_url", description="Submit a single URL for indexing.")
+@mutating_tool(name="submit_url", description="Submit a single URL for indexing.")
 async def submit_url(
     site_url: Annotated[str, "The URL of the site"],
     url: Annotated[str, "The specific URL to submit"],
@@ -266,7 +277,7 @@ async def submit_url(
     return {"message": f"URL {url} submitted successfully"}
 
 
-@mcp.tool(name="submit_url_batch", description="Submit multiple URLs for indexing.")
+@mutating_tool(name="submit_url_batch", description="Submit multiple URLs for indexing.")
 async def submit_url_batch(
     site_url: Annotated[str, "The URL of the site"], urls: List[str]
 ) -> Dict[str, Any]:
@@ -309,7 +320,7 @@ async def get_url_submission_quota(
 # Sitemap Tools
 
 
-@mcp.tool(name="submit_sitemap", description="Submit a sitemap to Bing.")
+@mutating_tool(name="submit_sitemap", description="Submit a sitemap to Bing.")
 async def submit_sitemap(
     site_url: Annotated[str, "The URL of the site"],
     sitemap_url: Annotated[str, "The URL of the sitemap"],
@@ -328,7 +339,7 @@ async def submit_sitemap(
     return {"message": f"Sitemap {sitemap_url} submitted successfully"}
 
 
-@mcp.tool(name="remove_sitemap", description="Remove a sitemap from Bing.")
+@mutating_tool(name="remove_sitemap", description="Remove a sitemap from Bing.")
 async def remove_sitemap(
     site_url: Annotated[str, "The URL of the site"],
     sitemap_url: Annotated[str, "The URL of the sitemap to remove"],
@@ -446,7 +457,7 @@ async def get_blocked_urls(site_url: Annotated[str, "The URL of the site"]) -> L
     return api._ensure_type_field(urls, "BlockedUrl")
 
 
-@mcp.tool(name="add_blocked_url", description="Block a URL or directory from being crawled.")
+@mutating_tool(name="add_blocked_url", description="Block a URL or directory from being crawled.")
 async def add_blocked_url(
     site_url: Annotated[str, "The URL of the site"],
     url: Annotated[str, "The URL or directory to block"],
@@ -471,7 +482,7 @@ async def add_blocked_url(
     return {"message": f"URL {url} blocked successfully"}
 
 
-@mcp.tool(name="remove_blocked_url", description="Remove a URL from the blocked list.")
+@mutating_tool(name="remove_blocked_url", description="Remove a URL from the blocked list.")
 async def remove_blocked_url(
     site_url: Annotated[str, "The URL of the site"],
     url: Annotated[str, "The blocked URL to remove"],
@@ -566,7 +577,7 @@ async def get_url_info(
 
 
 # Content Submission
-@mcp.tool(
+@mutating_tool(
     name="submit_content",
     description="Submit page content directly to Bing without crawling.",
 )
@@ -641,7 +652,7 @@ async def get_keyword_stats(
 
 
 # Connected Pages Management
-@mcp.tool(name="add_connected_page", description="Add a page that has a link to your website.")
+@mutating_tool(name="add_connected_page", description="Add a page that has a link to your website.")
 async def add_connected_page(
     site_url: Annotated[str, "The URL of your site"],
     connected_url: Annotated[str, "The URL of the page linking to your site"],
@@ -682,7 +693,7 @@ async def get_deep_link_blocks(
     return api._ensure_type_field(blocks, "DeepLinkBlock")
 
 
-@mcp.tool(
+@mutating_tool(
     name="add_deep_link_block",
     description="Block deep links for specific URL patterns.",
 )
@@ -738,7 +749,7 @@ async def get_query_parameters(
     return api._ensure_type_field(params, "QueryParameter")
 
 
-@mcp.tool(name="add_query_parameter", description="Add URL normalization parameter.")
+@mutating_tool(name="add_query_parameter", description="Add URL normalization parameter.")
 async def add_query_parameter(
     site_url: Annotated[str, "The URL of the site"],
     parameter: Annotated[str, "The query parameter to normalize"],
@@ -775,7 +786,7 @@ async def get_site_roles(site_url: Annotated[str, "The URL of the site"]) -> Lis
     return api._ensure_type_field(roles, "SiteRoles")
 
 
-@mcp.tool(name="add_site_roles", description="Delegate site access to another user.")
+@mutating_tool(name="add_site_roles", description="Delegate site access to another user.")
 async def add_site_roles(
     site_url: Annotated[str, "The URL of the site"],
     user_email: Annotated[str, "Email of the user to grant access"],
@@ -890,7 +901,7 @@ async def get_crawl_settings(site_url: Annotated[str, "The URL of the site"]) ->
     return api._ensure_type_field(settings, "CrawlSettings")
 
 
-@mcp.tool(name="update_crawl_settings", description="Update crawl settings for a site.")
+@mutating_tool(name="update_crawl_settings", description="Update crawl settings for a site.")
 async def update_crawl_settings(
     site_url: Annotated[str, "The URL of the site"],
     crawl_rate: Annotated[str, "Crawl rate setting"] = "Normal",
@@ -932,7 +943,7 @@ async def get_country_region_settings(
     return api._ensure_type_field(settings, "CountryRegionSettings")
 
 
-@mcp.tool(
+@mutating_tool(
     name="add_country_region_settings",
     description="Add country/region targeting settings.",
 )
@@ -964,7 +975,7 @@ async def add_country_region_settings(
 
 
 # Remove Methods
-@mcp.tool(name="remove_query_parameter", description="Remove a URL normalization parameter.")
+@mutating_tool(name="remove_query_parameter", description="Remove a URL normalization parameter.")
 async def remove_query_parameter(
     site_url: Annotated[str, "The URL of the site"],
     parameter: Annotated[str, "The query parameter to remove"],
@@ -987,7 +998,7 @@ async def remove_query_parameter(
     return {"message": f"Query parameter {parameter} removed successfully"}
 
 
-@mcp.tool(name="remove_deep_link_block", description="Remove a deep link block.")
+@mutating_tool(name="remove_deep_link_block", description="Remove a deep link block.")
 async def remove_deep_link_block(
     site_url: Annotated[str, "The URL of the site"],
     url_pattern: Annotated[str, "URL pattern to unblock"],
@@ -1011,7 +1022,7 @@ async def remove_deep_link_block(
 
 
 # Page Preview Block Management
-@mcp.tool(
+@mutating_tool(
     name="add_page_preview_block",
     description="Add a page preview block to prevent rich snippets.",
 )
@@ -1059,7 +1070,7 @@ async def get_active_page_preview_blocks(
     return api._ensure_type_field(blocks, "PagePreviewBlock")
 
 
-@mcp.tool(name="remove_page_preview_block", description="Remove a page preview block.")
+@mutating_tool(name="remove_page_preview_block", description="Remove a page preview block.")
 async def remove_page_preview_block(
     site_url: Annotated[str, "The URL of the site"],
     block_url: Annotated[str, "URL pattern to unblock"],
@@ -1083,7 +1094,7 @@ async def remove_page_preview_block(
 
 
 # Query Parameter Management Enhancement
-@mcp.tool(
+@mutating_tool(
     name="enable_disable_query_parameter",
     description="Enable or disable a URL query parameter.",
 )
@@ -1113,7 +1124,7 @@ async def enable_disable_query_parameter(
 
 
 # URL Fetching Tools
-@mcp.tool(name="fetch_url", description="Request Bing to fetch/crawl a specific URL.")
+@mutating_tool(name="fetch_url", description="Request Bing to fetch/crawl a specific URL.")
 async def fetch_url(
     site_url: Annotated[str, "The URL of the site"],
     url: Annotated[str, "The specific URL to fetch"],
@@ -1270,7 +1281,7 @@ async def get_feed_details(
     return api._ensure_type_field(details, "FeedDetails")
 
 
-@mcp.tool(name="remove_feed", description="Remove a feed from Bing Webmaster Tools.")
+@mutating_tool(name="remove_feed", description="Remove a feed from Bing Webmaster Tools.")
 async def remove_feed(
     site_url: Annotated[str, "The URL of the site"],
     feed_url: Annotated[str, "The URL of the feed to remove"],
@@ -1352,7 +1363,7 @@ async def get_site_moves(site_url: Annotated[str, "The URL of the site"]) -> Lis
     return api._ensure_type_field(moves, "SiteMove")
 
 
-@mcp.tool(name="submit_site_move", description="Submit a site move/migration notification.")
+@mutating_tool(name="submit_site_move", description="Submit a site move/migration notification.")
 async def submit_site_move(
     old_site_url: Annotated[str, "The old site URL"],
     new_site_url: Annotated[str, "The new site URL"],
@@ -1382,7 +1393,7 @@ async def submit_site_move(
 
 
 # Site Role Management Enhancement
-@mcp.tool(name="remove_site_role", description="Remove a user's access to a site.")
+@mutating_tool(name="remove_site_role", description="Remove a user's access to a site.")
 async def remove_site_role(
     site_url: Annotated[str, "The URL of the site"],
     user_email: Annotated[str, "Email of the user to remove"],
@@ -1404,7 +1415,7 @@ async def remove_site_role(
 
 
 # Country/Region Settings Enhancement
-@mcp.tool(
+@mutating_tool(
     name="remove_country_region_settings",
     description="Remove country/region targeting settings.",
 )

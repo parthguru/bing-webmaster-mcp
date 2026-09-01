@@ -141,7 +141,7 @@ cython_debug/
 Thumbs.db
 
 # Test files
-test_*.py
+/test_*.py
 validate_*.py
 VALIDATION_REPORT.md
 tests_archive/
