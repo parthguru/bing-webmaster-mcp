@@ -1,3 +1,9 @@
+# Every recipe runs under bash with pipefail, so a failing command in a
+# pipeline fails the target. Without this, `pytest ... | tail` reports the
+# exit code of `tail` -- which is how a red suite gets recorded as green.
+SHELL := /bin/bash
+.SHELLFLAGS := -eu -o pipefail -c
+
 .PHONY: install lint format test build deploy ship_it start mcp_inspector clean
 
 install:
@@ -10,10 +16,13 @@ lint:
 format:
 	uv run ruff format mcp_server_bwt/
 
+# Was: `pytest mcp_server_bwt --doctest-modules --junitxml=...$(cat .python-version)`,
+# which collected ZERO tests (the suite lives in tests/, not in the package) and
+# depended on .python-version, which is gitignored and absent. It reported success
+# while inspecting nothing. pytest exits 5 on "no tests collected", so this target
+# now fails loudly if the suite ever disappears.
 test:
-	uv run pytest mcp_server_bwt \
-		--doctest-modules \
-		--junitxml=reports/test-results-$(shell cat .python-version).xml
+	uv run pytest tests/ -v
 
 build: clean
 	uv run build
