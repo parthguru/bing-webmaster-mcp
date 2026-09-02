@@ -38,6 +38,18 @@ This resolves against the pins in `pyproject.toml` (notably `mcp[cli]>=1.10.0,<2
 ### npm package
 This fork is not yet published to npm under `@synectus/bing-webmaster-mcp` — `package.json` and the version-sync tooling are in place, but publishing is a separate decision (the existing `.github/workflows/publish.yml` still targets the old `@isiahw1/...` package name and needs updating before it's used). Until that's resolved, use the local `uv` install above or the Docker image.
 
+## Security: the API key leaks into logs
+
+`mcp_server_bwt/main.py` calls `logging.basicConfig(level=logging.INFO)` at import time, which sets the *root* Python logger to INFO. The Bing Webmaster API key is sent as a query parameter (`apikey=...`) on every single request to Bing, and `httpx`'s own request logger — which propagates to the root logger since nothing stops it — logs the full request URL, key included, at INFO:
+
+```
+INFO:httpx:HTTP Request: GET https://ssl.bing.com/webmaster/api.svc/json/GetUserSites?apikey=<LIVE KEY> "HTTP/1.1 200 OK"
+```
+
+This is **not** specific to Docker or to `BWT_READ_ONLY=false` — it happens on every tool call, read or write, on either transport. In a container it lands in `docker logs`; on stdio it goes to stderr, which most MCP clients capture and persist. Under `BWT_TENANTS` multi-tenant HTTP, every tenant's key lands in the same shared log stream, so one leaked log file exposes every client's key at once.
+
+**Mitigation (deliberately not implemented in this change — land it separately and review it on its own):** raise the `httpx` logger's level above INFO (`logging.getLogger("httpx").setLevel(logging.WARNING)`), or add a logging filter that strips the `apikey` query parameter before the record is emitted. Do not flip `BWT_READ_ONLY=false` or ship this to a deployment whose logs are retained or shipped anywhere until one of those is in place.
+
 ## Configuration
 
 Every variable below can be set directly in the environment or via a `.env` file (see `.env.example` for a fully commented copy).
@@ -216,6 +228,50 @@ The image defaults `MCP_TRANSPORT=http` and binds `0.0.0.0:8080`. Runs as a non-
 ### Site Migration
 - `get_site_moves` - Get history of site moves/migrations
 - `submit_site_move` **write** - Submit a site move/migration notification (validates both the old and new site against the allowlist)
+
+## Write Tools by Risk
+
+The 26 write tools aren't hidden by accident — `BWT_READ_ONLY=true` is the default precisely because some of them are low-stakes and some are not, and `tools/list` doesn't distinguish between the two. This table does. Before setting `BWT_READ_ONLY=false` on a real deployment, read it.
+
+**Rule applied:** a tool is **Consequential** if it changes who has access to the site, changes how Bing treats the entire property (not one URL), or cannot be undone by another API call at all. Everything else — scoped to a single URL, parameter, or pattern, with a paired add/remove call or a metered Bing-side allowance that resets on its own — is **Reversible**.
+
+### Reversible — undone by another call, or by time
+
+| Tool | What actually happens |
+|---|---|
+| `submit_url` | Submits one URL to Bing's crawl/index queue. Draws against the daily URL submission quota (see `get_url_submission_quota`) rather than changing any site setting. |
+| `submit_url_batch` | Same as `submit_url` for a list of URLs in one call; draws against the same quota. |
+| `submit_sitemap` | Registers a sitemap with Bing (`SubmitFeed`). Free to call again any time. |
+| `remove_sitemap` | Unregisters a sitemap. **Hits the same `RemoveFeed` endpoint as `remove_feed` below** — Bing has one underlying "feed" concept behind both tool names. Undo by resubmitting the sitemap URL with `submit_sitemap`. |
+| `remove_feed` | Unregisters a feed. **Same `RemoveFeed` endpoint as `remove_sitemap`** — treat the two tool names as one capability for review purposes; gating one and not the other gates neither. Undo by resubmitting via `submit_sitemap`. |
+| `add_blocked_url` | Adds a URL or directory to the crawl blocklist. |
+| `remove_blocked_url` | Removes a URL from the crawl blocklist — direct undo of `add_blocked_url`. |
+| `submit_content` | Pushes page HTML to Bing directly, skipping a crawl. Draws against the content submission quota (`get_content_submission_quota`) rather than editing configuration — Bing indexes the given content until its next normal crawl of that page. |
+| `add_connected_page` | Records that another page links to yours. No `remove_connected_page` tool exists in this server — undoing this specific call means going into the Bing Webmaster UI directly, not through this MCP server. Still Reversible by the rule above: it doesn't touch access or site-wide treatment, it's an informational hint. |
+| `add_deep_link_block` | Blocks Bing from surfacing deep links matching a URL pattern in search results. |
+| `remove_deep_link_block` | Removes a deep-link block — direct undo of `add_deep_link_block`. |
+| `add_query_parameter` | Tells Bing to ignore a URL query parameter for normalization/dedup. |
+| `remove_query_parameter` | Removes a normalization parameter — direct undo of `add_query_parameter`. |
+| `enable_disable_query_parameter` | Toggles an existing normalization parameter on or off — call again with the opposite value to undo. |
+| `add_page_preview_block` | Blocks Bing from generating a rich-snippet preview for a URL/pattern. |
+| `remove_page_preview_block` | Removes a preview block — direct undo of `add_page_preview_block`. |
+| `fetch_url` | Asks Bing to crawl one URL immediately. Draws against a Bing-side fetch allowance rather than changing configuration — there's nothing to undo, the effect is a queued crawl. |
+
+`fetch_url` and `submit_content` are both write-shaped for the same reason: neither edits site configuration, both spend a metered Bing-side allowance instead (`submit_url`/`submit_url_batch` spend the same kind of allowance, against the URL submission quota). They're gated as writes because they cost Bing-side quota that an unsupervised agent could burn through, not because they change how the site is configured.
+
+### Consequential — hard or impossible to undo, changes access, or changes how Bing treats the whole site
+
+| Tool | What actually happens | How you undo it |
+|---|---|---|
+| `add_site` | Adds a site to the account's managed-sites list. | `remove_site` — but re-adding later requires re-verification (`verify_site`) and rebuilding every per-site setting from scratch. |
+| `verify_site` | Attempts to verify domain ownership using whatever verification method Bing has on file for the site. | You can't retract a verification attempt through this API — it's Bing's record, not this tool's. |
+| `remove_site` | Removes the site from the Bing Webmaster account entirely — settings, blocked URLs, roles, and history for that property go with it. | `add_site` gets the site back on the list, but nothing else is restored automatically; every other per-site setting has to be rebuilt by hand. |
+| `add_site_roles` | Grants another user access to the site. **Takes a raw `auth_token` argument passed straight through to Bing as part of the request — the single most sensitive tool in this server.** Whoever can call this, or whoever obtains a valid token (including from the log leak above), can grant site access to anyone. | `remove_site_role` for that user's email. |
+| `remove_site_role` | Revokes a user's access to the site. | `add_site_roles` again — but that needs a fresh `auth_token` for that user, which the caller may not have. |
+| `submit_site_move` | Tells Bing the site has moved to a new domain/subdomain, which redirects Bing's ranking signal from the old property toward the new one. Both `old_site_url` and `new_site_url` are checked against the site allowlist. | No undo call exists. Submitting another move back to the original domain is possible, but signal already transferred is not guaranteed to fully return. |
+| `add_country_region_settings` | Sets geo-targeting for the whole property to a country/region. | `remove_country_region_settings` with the same country code. |
+| `remove_country_region_settings` | Removes geo-targeting for the whole property. | `add_country_region_settings` again with the same country/region. |
+| `update_crawl_settings` | Changes Bing's crawl rate (Slow/Normal/Fast) for the entire site, affecting how fast every page on it gets crawled. | `update_crawl_settings` again with the previous rate — read it first with `get_crawl_settings`, since the tool doesn't remember what it was. |
 
 ## Usage Examples
 
