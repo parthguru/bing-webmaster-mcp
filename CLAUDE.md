@@ -58,3 +58,21 @@ agents will give better control on model selection
 7. Checkpoint System
 after each meaningful change do commit
 keep commit granular for better checkpoints
+
+## Testing rule: a negative test needs a positive control
+
+A test that only asserts something is *absent* proves nothing on its own — it
+passes just as happily when the fixture never contained the thing, when the
+code under test was never reached, or when the harness is wired to the wrong
+object. Assert the unprotected case FIRST, then the protected one:
+
+```python
+assert SECRET in unprotected, "positive control"   # would have leaked
+assert SECRET not in protected                     # does not leak
+```
+
+This is a rule because it caught two false passes in one day (2026-09-02):
+a secret scan run against a directory that was not yet a git repo (empty diff
+-> "clean"), and a tenant-isolation probe that never bound a tenant and so
+"proved" a leak that did not exist. Both looked green. Neither inspected
+anything. See tests/test_key_redaction.py for the shape.

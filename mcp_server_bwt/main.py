@@ -9,6 +9,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 from typing import Annotated, Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -18,8 +19,40 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 
+# --- API key redaction ---------------------------------------------------
+# The BWT API key travels as an `apikey=` QUERY PARAMETER, so it appears in
+# every request URL. Anything that renders a URL -- httpx's INFO request log,
+# an httpx exception message, a traceback -- would otherwise expose the live
+# key. Exceptions matter more than logs: an exception message can propagate
+# back to the MCP client and land in a conversation transcript, which cannot
+# be grepped or rotated after the fact.
+_APIKEY_RE = re.compile(r"(apikey=)[^&\s\"'\\]+", re.IGNORECASE)
+
+
+def redact_api_key(text: str) -> str:
+    """Replace any apikey=... value with apikey=REDACTED."""
+    return _APIKEY_RE.sub(r"\1REDACTED", str(text))
+
+
+class RedactingFormatter(logging.Formatter):
+    """Redacts the FORMATTED record, so it covers the message, its args, and
+    rendered traceback text alike. A logging.Filter would miss tracebacks
+    (they are rendered from exc_info after filters run) and would only see
+    records logged through the logger it is attached to, not propagated ones.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_api_key(super().format(record))
+
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
+# Belt: httpx logs full request URLs at INFO, so the key would be written on
+# every call. Braces: the formatter below scrubs anything that slips through,
+# including third-party loggers added later and traceback text.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+for _handler in logging.getLogger().handlers:
+    _handler.setFormatter(RedactingFormatter(_handler.formatter._fmt if _handler.formatter else None))
 logger = logging.getLogger(__name__)
 
 # Initialize MCP server with capabilities
@@ -213,7 +246,9 @@ class BingWebmasterAPI:
 
             if response.status_code != 200:
                 logger.error("API error %d for %s", response.status_code, endpoint)
-                raise Exception(f"API error {response.status_code}: {response.text}")
+                raise Exception(
+                    f"API error {response.status_code}: {redact_api_key(response.text)}"
+                )
 
             data = response.json()
 
@@ -224,7 +259,18 @@ class BingWebmasterAPI:
 
         except httpx.TimeoutException:
             logger.error("Request timeout for %s", endpoint)
-            raise
+            # `from None` on purpose: httpx embeds the full request URL -- key
+            # included -- in its exception, and a chained __context__ would
+            # carry that raw text into any traceback shown to the caller.
+            raise TimeoutError(f"Bing API request timed out for {endpoint}") from None
+        except httpx.HTTPError as e:
+            # Every other httpx failure (connect, protocol, decode) also embeds
+            # the URL. Re-raise redacted and unchained so no key can reach the
+            # MCP client, which is a conversation transcript we cannot scrub.
+            logger.error("HTTP error for %s: %s", endpoint, type(e).__name__)
+            raise RuntimeError(
+                f"Bing API request failed for {endpoint}: {redact_api_key(e)}"
+            ) from None
 
     def _ensure_type_field(self, data: Any, type_name: str) -> Any:
         """Ensure __type field is present for MCP compatibility."""
