@@ -4,7 +4,7 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 
-.PHONY: install lint format test build deploy ship_it start mcp_inspector clean
+.PHONY: install lint format test build deploy start mcp_inspector clean
 
 install:
 	uv sync
@@ -29,8 +29,9 @@ build: clean
 
 deploy: install build
 
-ship_it: build
-	git push
+# `ship_it: build / git push` removed 2026-09-02. This repo's remote was the
+# UPSTREAM author's public repository, so one word published Synectus work to a
+# stranger's repo. Pushing is now deliberate and manual, never a make target.
 
 start:
 	uv run mcp_server_bwt/main.py
